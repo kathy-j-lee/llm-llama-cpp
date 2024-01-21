@@ -18,7 +18,7 @@ except ImportError:
     from pydantic.fields import Field
 
 try:
-    from llama_cpp import Llama
+    from llama_cpp import Llama, LlamaGrammar
 except ImportError:
     Llama = None
     print(
@@ -64,7 +64,6 @@ def register_models(register):
             ),
             aliases=details["aliases"],
         )
-    register(LlamaGGUF())
 
 
 @llm.hookimpl
@@ -190,9 +189,27 @@ class LlamaModel(llm.Model):
             description="Number of GPU layers to use, defaults to 1", default=None
         )
         max_tokens: int = Field(
-            description="Max tokens to return, defaults to 4000", default=None
+            description="Max tokens to return, defaults to 4000", default=-1
         )
-        n_ctx: int = Field(description="n_ctx argument, defaults to 4000", default=None)
+        temperature: float = Field(
+            description="Temperature, defaults to 0.7", default=0.7
+        )
+        top_p: float = Field(
+            description="Top p, defaults to 0.7", default=0.95
+        )
+        n_ctx: int = Field(
+            description="n_ctx argument, defaults to 4096", default=None
+        )
+        # 2024/1/12 changed from grammar to grammar_file
+        grammar_file: str = Field(
+            description="grammar file path", default=None)
+        threads: int = Field(
+            description="number of threads to use during generation", default=16
+        )
+        threads_batch: int = Field(
+            description="number of threads to use during batch and prompt processing", default=16
+        )
+        
 
     def __init__(self, model_id, path, is_llama2_chat: bool = False):
         self.model_id = model_id
@@ -246,9 +263,6 @@ class LlamaModel(llm.Model):
         prompt_bits.append(f"{prompt.prompt} [/INST] ")
         return prompt_bits
 
-    def get_path(self, options):
-        return self.path
-
     def execute(self, prompt, stream, response, conversation):
         with SuppressOutput(verbose=prompt.options.verbose):
             kwargs = {"n_ctx": prompt.options.n_ctx or 4000, "n_gpu_layers": 1}
@@ -256,10 +270,13 @@ class LlamaModel(llm.Model):
                 kwargs.pop("n_gpu_layers")
             if prompt.options.n_gpu_layers:
                 kwargs["n_gpu_layers"] = prompt.options.n_gpu_layers
+            if prompt.options.threads:
+                kwargs["threads"] = prompt.options.threads
+            if prompt.options.threads_batch:
+                kwargs["threads_batch"] = prompt.options.threads_batch
+
             llm_model = Llama(
-                model_path=self.get_path(prompt.options),
-                verbose=prompt.options.verbose,
-                **kwargs,
+                model_path=self.path, verbose=prompt.options.verbose, **kwargs
             )
             if self.is_llama2_chat:
                 prompt_bits = self.build_llama2_chat_prompt(prompt, conversation)
@@ -267,31 +284,37 @@ class LlamaModel(llm.Model):
                 response._prompt_json = {"prompt_bits": prompt_bits}
             else:
                 prompt_text = prompt.prompt
-            stream = llm_model(
-                prompt_text, stream=True, max_tokens=prompt.options.max_tokens or 4000
-            )
+
+            if prompt.options.grammar_file:
+                grammar = LlamaGrammar.from_file(prompt.options.grammar_file, verbose=False)
+                stream = llm_model(
+                    prompt_text, 
+                    stream=True, 
+                    max_tokens=prompt.options.max_tokens or -1,
+                    temperature=prompt.options.max_tokens or 0.7, 
+                    top_p=prompt.options.top_p or 0.95,
+                    grammar=grammar
+                    # n_gpu_layers=prompt.options.n_gpu_layers or 1,
+                    # threads=prompt.options.threads or 4,
+                    # threads_batch=prompt.options.threads_batch or 4,
+                )
+            else:
+                stream = llm_model(
+                    prompt_text, 
+                    stream=True, 
+                    max_tokens=prompt.options.max_tokens or -1,
+                    temperature=prompt.options.max_tokens or 0.7, 
+                    top_p=prompt.options.top_p or 0.95,
+                    # n_gpu_layers=prompt.options.n_gpu_layers or 1,
+                    # threads=prompt.options.threads or 4,
+                    # threads_batch=prompt.options.threads_batch or 4,
+                )
             for item in stream:
                 # Each item looks like this:
                 # {'id': 'cmpl-00...', 'object': 'text_completion', 'created': .., 'model': '/path', 'choices': [
                 #   {'text': '\n', 'index': 0, 'logprobs': None, 'finish_reason': None}
                 # ]}
                 yield item["choices"][0]["text"]
-
-
-class LlamaGGUF(LlamaModel):
-    model_id = "gguf"
-    is_llama2_chat = False
-
-    class Options(LlamaModel.Options):
-        path: str = Field(
-            description="Path to a model GGUF file",
-        )
-
-    def __init__(self):
-        pass
-
-    def get_path(self, options):
-        return options.path
 
 
 def human_size(num_bytes):
